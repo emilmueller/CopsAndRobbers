@@ -1,0 +1,548 @@
+
+/*
+ * SOI 2014, Creativity Task "Cops and Robbers"
+ * Server by samuel at soi dot ch
+ *
+ * 
+ * Usage: 
+ * In a terminal, go to the folder containing Server.class
+ * Then run
+ * java Server mouseXCommand copsCommand C R mapPath startPosMouseX startPosCop1 startPosCop2 ...
+ *  
+ * Example:
+ * 
+ * java Server ../../sample-bots/SampleBotC.bin ../../sample-bots/SampleBotC.bin 3 20 ../../maps/map1.txt 5 1 2 3
+ *
+ * Hint:
+ * Program can write debug output to their stderr, and this output is copied to stderr of Server.
+ * 
+ */
+
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Scanner;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+
+@SuppressWarnings("serial")
+class ProtocolViolatedException extends Exception {
+	public ProtocolViolatedException(String message) {
+		super(message);
+	}
+}
+@SuppressWarnings("serial")
+class BadUserInputException extends Exception {
+	public BadUserInputException(String message) {
+		super(message);
+	}
+}
+
+
+public class Server {
+	
+	class PutStringsFromReaderIntoQueueThread extends Thread {
+		private ArrayBlockingQueue<String> queue;
+		private BufferedReader reader;
+		public volatile boolean terminating = false;
+		
+		public PutStringsFromReaderIntoQueueThread(ArrayBlockingQueue<String> queue, BufferedReader reader) {
+			this.queue = queue;
+			this.reader = reader;
+		}
+	
+		@Override
+		public void run() {
+			try {
+				while (true) {
+					String line = reader.readLine();
+					if (line == null) {
+						// program has terminated
+						break;
+					} else {
+						// blocks if no space in queue
+						queue.put(line);
+					}
+				}
+			} 
+			// At the moment when program is terminated, we can be blocking on:
+			// - reader.readLine() => IOException because stream is closed while we're reading from it
+			// - queue.put(line) => InterruptedException
+			// If such an exception occurs before we're terminating, something went wrong and we print it:
+			catch (InterruptedException e) {
+				if (!terminating) e.printStackTrace();
+			} catch (IOException e) {
+				if (!terminating) e.printStackTrace();
+			}
+		}	
+	}
+
+	class StdErrGobbler extends Thread {
+		private Program prog;
+		public volatile boolean terminating = false;
+		public static final int MAX_STDERR_LINES = 1000;
+		
+		public StdErrGobbler(Program prog) {
+			this.prog = prog;
+		}
+	
+		@Override
+		public void run() {
+			//logTechnical("StdErrGobbler for " + prog.getId() + " started...");
+			try {
+				for (int i=0; i<MAX_STDERR_LINES; ++i) {
+					String line = prog.programErr.readLine();
+					if (line == null) {
+						// program has terminated
+						return; // <- BEWARE
+					} else {
+						logProgramsStderr(prog, line);
+					}
+				}
+				logTechnical("Note: " + prog.getId() + " has printed " + MAX_STDERR_LINES + " lines to stderr."
+						      + " That's too much, so we will kill it");
+				// Note: We just hope that the program does not output infinite amounts of garbage without any newlines...
+				// Note2: The same should also be done for stdout of program...
+				prog.terminate();
+			} catch (IOException e) {
+				// At the moment when program is terminated, we can only be blocking on:
+				// reader.readLine() => IOException thrown because stream is closed while we're reading from it
+				// If such an exception occurs before we're terminating, something went wrong and we print it:
+				if (!terminating) {
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+	
+	abstract class Program {
+		/** path to directory in which program has to be executed */
+		//final String workingDirPath;
+		/** first element is program path, then followed by arguments */
+		//final String[] cmdArray;
+		String command;
+		
+		PrintWriter programOut;
+		private BufferedReader programIn;
+		private BufferedReader programErr;
+		private Process process;
+		
+		private ArrayBlockingQueue<String> programInQ;
+		private PutStringsFromReaderIntoQueueThread putStringsFromReaderIntoQueueThread;
+		private StdErrGobbler stdErrGobbler;
+		private static final int LONG_TIMEOUT = 10000;
+		private static final int SHORT_TIMEOUT = 1000;
+		
+		Program(String cmd) {
+			this.command = cmd;
+		}
+		
+		abstract String getId();
+		
+		public void start() throws IOException {			
+			process = Runtime.getRuntime().exec(command);
+					
+			programOut = new PrintWriter(new OutputStreamWriter(process.getOutputStream()));
+			programIn = new BufferedReader(new InputStreamReader(process.getInputStream()));
+			
+			programErr = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+			
+			programInQ = new ArrayBlockingQueue<String>(1, true);
+			putStringsFromReaderIntoQueueThread = new PutStringsFromReaderIntoQueueThread(programInQ, programIn);
+			putStringsFromReaderIntoQueueThread.start();
+			stdErrGobbler = new StdErrGobbler(this);
+			stdErrGobbler.start();
+		}
+				
+		abstract void feedOwnPos() throws IOException;
+		
+		abstract void feedOpponentPos() throws IOException;
+		
+		abstract void feedRole() throws IOException;
+		
+		abstract void readMove() throws IOException, ProtocolViolatedException;
+		
+		void playRound() throws IOException, ProtocolViolatedException {
+			feedOpponentPos();
+			readMove();
+		}
+		
+		public void feedCopsPos() throws IOException {
+			String sep = "";
+			for (int i = 0; i < C; ++i) {
+				programOut.print(sep);
+				programOut.print(copsPos[i]);
+				sep = " ";
+			}
+			programOut.println();
+			programOut.flush();
+		}
+		
+		public void feedMouseXPos() throws IOException {
+			programOut.println(mouseXPos);
+			programOut.flush();
+		}
+				
+		public void feedStartData() throws IOException {
+			feedRole();
+			programOut.println(C);
+			programOut.println(R);
+			programOut.println(N + " " + M);
+			for (int i = 0; i < M; ++i) {
+				programOut.println(streets[i].a + " " + streets[i].b);
+			}
+			feedOwnPos();
+		}
+
+		public String readLine() throws IOException, ProtocolViolatedException {
+			try {
+				String res;			
+				String line1 = programInQ.poll(SHORT_TIMEOUT, TimeUnit.MILLISECONDS);			
+				if (line1 == null) {
+					// no line was available within timeout
+					if (putStringsFromReaderIntoQueueThread.isAlive()) {
+						// Program is working a lot, blocked or in endless loop
+						String line2 = programInQ.poll(LONG_TIMEOUT, TimeUnit.MILLISECONDS);
+						if (line2 == null) {
+							// Program is blocked or in endless loop
+							throw new ProtocolViolatedException(this.getId() + 
+							   " could not print a line within " + (SHORT_TIMEOUT + LONG_TIMEOUT) + "ms");
+						} else {
+							// Program worked a lot, but managed to finish within timeout
+							logProgramsBehavior(this, "needed between " + SHORT_TIMEOUT + " and "
+									+ LONG_TIMEOUT + " to print a line, that's quite long!");
+							res = line2;
+						}
+					} else {
+						// Program crashed => EOF of program's output reached 
+						// => putStringsFromReaderIntoQueueThread has finished its work
+						throw new ProtocolViolatedException(this.getId() 
+								+ " terminated instead of printing a line");
+					}			
+				} else {
+					// got a line within timeout
+					res = line1;
+				}
+				// if we return null, this.process will be terminated and restarted
+				return res;
+			} catch (InterruptedException e) {
+				throw new RuntimeException(e);
+			}
+		}
+		
+		volatile boolean terminating = false;
+		
+		public void terminate() throws IOException {
+			synchronized (this) {
+				if (terminating) return;
+				terminating = true;
+			}
+			putStringsFromReaderIntoQueueThread.terminating = true;
+			putStringsFromReaderIntoQueueThread.interrupt();
+			stdErrGobbler.terminating = true;
+			// no need to interrupt stdErrGobbler, it will terminate because stderr is closed
+			closeStreams();
+		}
+		
+		// not used, because participants' programs are not required to terminate themselves
+		public void waitForAndTerminate() throws IOException {
+			putStringsFromReaderIntoQueueThread.interrupt();
+			stdErrGobbler.terminating = true;
+			// no need to interrupt stdErrGobbler, it will terminate because stderr is closed
+			
+			Thread terminator = new Thread() {
+				@Override
+				public void run() {
+					try {
+						int exitVal = process.waitFor();
+						logProgramsBehavior(Program.this, "exited with status " + exitVal);
+					} catch (InterruptedException e) {
+						process.destroy();
+						logProgramsBehavior(Program.this, "did not properly exit and was therefore killed");
+					}
+				}
+			};
+			terminator.start();
+			
+			try {
+				terminator.join(1000);
+				if (terminator.isAlive()) {
+					// 1000 milliseconds were not enough for the terminator to finish
+					terminator.interrupt();
+				}
+			} catch (InterruptedException e) {
+				throw new RuntimeException(e);
+			}
+			
+			closeStreams();
+		}
+		
+		private void closeStreams() throws IOException {
+			programOut.close();
+			programIn.close();
+			programErr.close();
+		}
+	}
+	
+	class CopsProgram extends Program {
+		CopsProgram(String cmd) {
+			super(cmd);
+		}
+		void feedOwnPos() throws IOException {
+			feedCopsPos();			
+		}
+		void feedOpponentPos() throws IOException {
+			feedMouseXPos();
+		}
+		void feedRole() throws IOException {
+			programOut.println('P');
+			programOut.flush();
+		}
+		void readMove() throws IOException, ProtocolViolatedException {
+			String[] a = readLine().split(" ");
+			if (a.length != C) {
+				throw new ProtocolViolatedException("expected " + C + " numbers from cops program, but got " + a.length);
+			}
+			for (int i = 0; i < C; ++i) {
+				int newPos = Integer.parseInt(a[i]);
+				checkMove("Cop " + (i+1), copsPos[i], newPos);
+				logGame("Cop " + (i+1) + " moves to junction " + newPos);
+				copsPos[i] = newPos; 
+			}			
+		}
+		String getId() {
+			return "Cops";
+		}
+	}
+	
+	class MouseXProgram extends Program {
+		MouseXProgram(String cmd) {
+			super(cmd);
+		}
+		void feedOwnPos() throws IOException {
+			feedMouseXPos();
+		}
+		void feedOpponentPos() throws IOException {
+			feedCopsPos();
+		}
+		void feedRole() throws IOException {
+			programOut.println('X');
+			programOut.flush();
+		}
+		void readMove() throws IOException, ProtocolViolatedException {
+			String s = readLine();
+			int newPos = Integer.parseInt(s);
+			checkMove("Mouse X", mouseXPos, newPos);
+			logGame("Mouse X moves to junction " + newPos);
+			mouseXPos = newPos; 
+		}
+		String getId() {
+			return "Mouse X";
+		}
+	}
+	
+	void checkMove(String who, int from, int to) throws ProtocolViolatedException {
+		if (!(from == to || G.get(from).contains(to))) {
+			throw new ProtocolViolatedException(who + " wants to move from junction " 
+		        + from + " to junction " + to + ", but they're not neighbors nor the same junction"); 
+		}
+	}
+	
+	// command line arguments
+	String mouseXCommand;
+	String copsCommand;
+	int C;
+	int R;	
+	String mapPath;
+	int mouseXPos;
+	int[] copsPos;
+	
+	// graph 
+	int N; // number of junctions
+	int M; // number of streets
+	List<List<Integer>> G; // 1-based adjacency list
+	
+	// the streets (redundant)
+	class Street {
+		public final int a,b;
+		void checkRange(int x) {
+			if (x < 1 || x > N) {
+				throw new IllegalArgumentException(x + " is not a valid junction");
+			}
+		}
+		public Street(int a, int b) {
+			checkRange(a);
+			checkRange(b);
+			this.a = a;
+			this.b = b;
+		}
+	}
+	Street[] streets;
+	
+	// participants' programs
+	Program copsProg;
+	Program mouseXProg;
+	
+	public static void main(String[] args) throws IOException {
+		new Server(args);
+	}
+	
+	Server(String[] args) throws IOException {
+		// System.out.println("JRE version: " + System.getProperty("java.version"));
+		if (parseArgs(args)) {
+			run();
+		} else {
+			System.out.println("Sorry, could not parse arguments, try harder");
+		}
+	}
+	
+	boolean parseArgs(String[] args) {
+		try {
+			mouseXCommand = args[0];
+			copsCommand = args[1];
+			C = Integer.parseInt(args[2]);
+			R = Integer.parseInt(args[3]);
+			mapPath =  args[4];
+			mouseXPos = Integer.parseInt(args[5]);
+			copsPos = new int[C];
+			for (int i=0; i<C; ++i) copsPos[i] = Integer.parseInt(args[6+i]);
+			return true;
+		} catch (Exception e) {
+			return false;
+		}
+	}
+	
+	void parseGraph() throws BadUserInputException {
+		try {
+			Scanner sc = new Scanner(new File(mapPath));
+			N = sc.nextInt();
+			M = sc.nextInt();
+			G = new ArrayList<List<Integer>>(N+1);
+			for (int i = 0; i <= N; ++i) {
+				G.add(new ArrayList<Integer>());
+			}
+			streets = new Street[M];
+			for (int i=0; i<M; ++i) {
+				int a = sc.nextInt();
+				int b = sc.nextInt();
+				G.get(a).add(b);
+				G.get(b).add(a);
+				streets[i] = new Street(a, b);
+			}		
+			sc.close();
+		} catch (Exception e) {
+			throw new BadUserInputException("Something's wrong with the map");
+		}
+	}
+	
+	boolean caught() {
+		for (int i = 0; i < C; ++i) {
+			if (mouseXPos == copsPos[i]) return true;
+		}
+		return false;
+	}
+	
+	void check(boolean cond, String condStr) throws BadUserInputException {
+		if (!cond) throw new BadUserInputException(condStr + " is violated");
+	}
+	
+	void inputSanityCheck() throws BadUserInputException {
+		check(C >= 1, "C >= 1");
+		check(R >= 1, "R >= 1");
+		check(mouseXPos >= 1 && mouseXPos <= N, "1 <= startPosMouseX <= N");
+		for (int i=0; i<C; ++i) {
+			check(copsPos[i] >= 1 && copsPos[i] <= N, "1 <= startPosCops[" + (i+1) + "] <= N");
+		}
+	}
+	
+	void run() throws IOException {
+		try {
+			parseGraph();
+			inputSanityCheck();
+		} catch (BadUserInputException e) {
+			logGame("Cannot start the game because " + e.getMessage());
+			return;
+		}
+		
+		playGame();
+	}
+		
+	void playGame() throws IOException {	
+		mouseXProg = new MouseXProgram(mouseXCommand);
+		copsProg = new CopsProgram(copsCommand);
+		
+		mouseXProg.start();
+		copsProg.start();
+		
+		mouseXProg.feedStartData();
+		copsProg.feedStartData();
+		
+		logGame("Mouse X starts on junction " + mouseXPos);
+		for (int i=0; i<C; ++i) {
+			logGame("Cop " + (i+1) + " starts on junction " + copsPos[i]);
+		}
+
+		try {
+			boolean mouseXWon = true;
+			
+			for (int round = 1; round <= R; ++round) {
+				logGame("Round " + round + ":");
+				
+				mouseXProg.playRound();
+				if (caught()) {
+					logGame("Mouse X moved to a cell occupied by a cop and is caught!");
+					mouseXWon = false;
+					break;
+				}
+				copsProg.playRound();
+				if (caught()) {
+					logGame("A cop moved on Mouse X's junction and caught Mouse X!");
+					mouseXWon = false;
+					break;
+				}
+			}
+			
+			if (mouseXWon) {
+				logGame("Mouse X survived " + R + " rounds and thus wins!");
+			}
+		} catch (ProtocolViolatedException e) {
+			logGame("Game could not be played to end because " + e.getMessage());
+		} finally {
+			/*
+			System.err.println("Now you can open your system monitor and see how much memory each " +
+					"program consumes. Once you're done, hit enter to terminate them.");
+			Scanner sc = new Scanner(System.in);
+			sc.nextLine();
+			*/
+			
+			logTechnical("Going to terminate all bots...");
+			copsProg.terminate();
+			mouseXProg.terminate();
+			logTechnical("All bots terminated.");
+		}
+	}
+
+	synchronized static void logGame(String s) {
+		System.out.println(s);
+	}
+			
+	synchronized static void logTechnical(String s) {
+		System.err.println(s);
+	}
+	
+	synchronized static void logProgramsStderr(Program p, String s) {
+		System.err.println("[stderr of " + p.getId() + "] " + s);
+	}
+	
+	synchronized static void logProgramsBehavior(Program p, String s) {
+		System.err.println(p.getId() + " " + s);
+	}
+	
+}
