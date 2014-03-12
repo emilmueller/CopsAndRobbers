@@ -19,7 +19,7 @@
  */
 
 
-/* Laptop 2 */
+/* Desk 3 */
 
 import java.io.BufferedReader;
 import java.io.File;
